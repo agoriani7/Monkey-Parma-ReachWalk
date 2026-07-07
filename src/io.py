@@ -134,3 +134,21 @@ def load_epochs(subject: str, session: str, event_type: str) -> dict:
         epochs_data = {key: data[key] for key in data.files}
         
     return epochs_data
+
+def load_cwt_epochs(subject: str, session: str, event_type: str) -> dict:
+    """
+    Loads the CWT epoched tensors, corresponding labels, and frequency vectors from disk.
+    Returns a dictionary containing 'cwt_tensor', 'labels', and 'freqs'.
+    """
+    # Construct the exact path for the CWT processed data
+    file_path = PROCESSED_DATA_DIR / subject / session / f"epoched_cwt_{event_type}.npz"
+    
+    if not file_path.exists():
+        raise FileNotFoundError(f"CWT epoched data not found at {file_path}")
+        
+    # Load the compressed .npz file
+    with np.load(file_path, allow_pickle=True) as data:
+        # Convert the NpzFile object to a standard Python dictionary to avoid lazy-loading issues
+        cwt_data = {key: data[key] for key in data.files}
+        
+    return cwt_data

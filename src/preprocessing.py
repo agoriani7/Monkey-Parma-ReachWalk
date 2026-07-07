@@ -4,7 +4,8 @@ from src.config import (
     EPOCH_T_PRE, EPOCH_T_POST, BASELINE_T_START, BASELINE_T_END, FREQ_BANDS
 )
 from src.io import load_binary_session, load_lfp_recording, load_envelopes
-from scipy.signal import butter, sosfiltfilt, hilbert
+from scipy.signal import hilbert
+import pywt
 from scipy.ndimage import uniform_filter1d
 import numpy as np
 import pandas as pd
@@ -145,6 +146,17 @@ def epoch_and_normalize_envelopes(subject: str, session: str, event_type: str = 
                  df_events['Surface'].fillna('unknown').astype(str)
         labels = labels.values
         baseline_timestamps = df_events.groupby('WalkNumber')['StepTime'].transform('min').values
+
+    # Load and apply manual artifact mask
+    bad_trials_file = PROCESSED_DATA_DIR / subject / session / f"bad_trials_{event_type}.csv"
+    if bad_trials_file.exists():
+        df_bad = pd.read_csv(bad_trials_file)
+        valid_mask = ~df_bad['is_artifact'].values.astype(bool)
+        
+        timestamps = timestamps[valid_mask]
+        labels = labels[valid_mask]
+        baseline_timestamps = baseline_timestamps[valid_mask]
+
     # Pre-compute indices 
     samples_pre = int(EPOCH_T_PRE * fs)
     samples_post = int(EPOCH_T_POST * fs)
@@ -233,4 +245,155 @@ def epoch_and_normalize_envelopes(subject: str, session: str, event_type: str = 
     np.savez_compressed(out_path, labels=np.array(final_labels), **epoched_data)
     
     return
+
+def extract_cwt_epochs(subject: str, session: str, event_type: str = 'grasp', pad_s: float = 2.0, target_fs: float = 100.0, n_freqs: int = 50) -> None:
+    """
+    Extracts epoched LFP data, computes Continuous Wavelet Transform (Morlet) 
+    on padded windows to prevent edge artifacts, and downsamples the power.
+    Saves the 4D tensor (trials, freqs, time, channels) to an .npz file.
+    """
+    events_dir = RAW_DATA_DIR / subject / session / "Events"
+    csv_file = events_dir / f"{session}{EVENT_SUFFIXES.get(event_type)}"
     
+    if not csv_file or not csv_file.exists():
+        print(f"No '{event_type}' events found for {subject}/{session}.")
+        return
+
+    df_events = pd.read_csv(csv_file)
+    
+    # Construct timestamps and labels
+    if event_type == 'grasp':
+        timestamps = df_events['EventTime'].values
+        labels = df_events['Target'].fillna('unknown').astype(str) + "_" + df_events['Hand'].fillna('unknown').astype(str)
+        labels = labels.values
+        baseline_timestamps = timestamps
+    elif event_type == 'steps':
+        timestamps = df_events['StepTime'].values
+        labels = df_events['StepType'].fillna('unknown').astype(str) + "_" + \
+                 df_events['Hand'].fillna('unknown').astype(str) + "_" + \
+                 df_events['Surface'].fillna('unknown').astype(str)
+        labels = labels.values
+        baseline_timestamps = df_events.groupby('WalkNumber')['StepTime'].transform('min').values
+
+    # Load and apply manual artifact mask
+    bad_trials_file = PROCESSED_DATA_DIR / subject / session / f"bad_trials_{event_type}.csv"
+    if bad_trials_file.exists():
+        df_bad = pd.read_csv(bad_trials_file)
+        valid_mask = ~df_bad['is_artifact'].values.astype(bool)
+        
+        timestamps = timestamps[valid_mask]
+        labels = labels[valid_mask]
+        baseline_timestamps = baseline_timestamps[valid_mask]
+
+    # Load 1000Hz LFP data
+    recording_lfp = load_lfp_recording(subject, session, "lfp_1000Hz")
+    fs_lfp = recording_lfp.get_sampling_frequency()
+    num_channels = recording_lfp.get_num_channels()
+    total_samples = recording_lfp.get_num_samples()
+
+    # CWT Parameters setup (Logarithmic spacing from 1 Hz to 250 Hz)
+    freqs = np.logspace(np.log10(2.0), np.log10(250.0), num=n_freqs)
+    
+    # Time and downsampling parameters
+    samples_pre_pad = int((EPOCH_T_PRE + pad_s) * fs_lfp)
+    samples_post_pad = int((EPOCH_T_POST + pad_s) * fs_lfp)
+    ds_factor = int(fs_lfp / target_fs)
+    pad_ds = int(pad_s * target_fs)
+    smooth_window = int(0.05 * fs_lfp) # smoothing window of 50 ms for the power time series after CWT
+
+    # Define Complex Morlet wavelet: Bandwidth=1.5, Center Frequency=1.0 Hz
+    wavelet_name = 'cmor1.5-1.0'
+    sampling_period = 1.0 / fs_lfp
+
+    # Back-calculate wavelet scales from target frequencies (2 to 250 Hz)
+    center_freq = pywt.central_frequency(wavelet_name)
+    scales = center_freq / (freqs * sampling_period)
+
+    raw_trial_tfrs = []
+    valid_labels_pass1 = []
+    baseline_means = {}
+    baseline_stds = {}
+
+    for i, (t, t_base) in enumerate(tqdm(zip(timestamps, baseline_timestamps), desc=f"Processing {event_type} CWT", total=len(timestamps))):
+        idx = int(t * fs_lfp)
+        
+        # Calculate baseline boundaries
+        base_start_idx = int(t_base * fs_lfp) + int(BASELINE_T_START * fs_lfp)
+        base_end_idx = int(t_base * fs_lfp) + int(BASELINE_T_END * fs_lfp)
+        
+        # Boundary check for both epoch and baseline padded windows
+        if (idx - samples_pre_pad < 0) or (idx + samples_post_pad > total_samples) or \
+           (base_start_idx - samples_pre_pad < 0) or (base_end_idx + samples_post_pad > total_samples):
+            continue
+            
+        # Compute CWT for Baseline
+        if t_base not in baseline_means:
+            pad_base_epoch = recording_lfp.get_traces(
+                start_frame=base_start_idx - pad_s * fs_lfp, 
+                end_frame=base_end_idx + pad_s * fs_lfp, 
+                return_scaled=False
+            )
+            n_times_pad_ds = len(np.arange(0, pad_base_epoch.shape[0], ds_factor))
+            base_tfr = np.zeros((n_freqs, n_times_pad_ds, num_channels), dtype=np.float32)
+            
+            for ch in range(num_channels):
+                cwt_mat, frequencies = pywt.cwt(pad_base_epoch[:, ch], scales, wavelet_name, sampling_period=sampling_period)
+                power = np.abs(cwt_mat)**2
+                base_tfr[:, :, ch] = uniform_filter1d(power, size=smooth_window, axis=1)[:, ::ds_factor]
+                
+            base_tfr_trimmed = base_tfr[:, pad_ds:-pad_ds, :]
+            # Compute mean/std keeping dims for broadcasting -> (n_freqs, 1, num_channels)
+            baseline_means[t_base] = np.mean(base_tfr_trimmed, axis=1, keepdims=True)
+            baseline_stds[t_base] = np.std(base_tfr_trimmed, axis=1, keepdims=True)
+
+        # --- 2. Compute CWT for Epoch ---
+        padded_epoch = recording_lfp.get_traces(
+            start_frame=idx - samples_pre_pad, 
+            end_frame=idx + samples_post_pad, 
+            return_scaled=False
+        )
+        n_times_pad_ds = len(np.arange(0, padded_epoch.shape[0], ds_factor))
+        trial_tfr = np.zeros((n_freqs, n_times_pad_ds, num_channels), dtype=np.float32)
+
+        for ch in range(num_channels):
+            cwt_mat, _ = pywt.cwt(padded_epoch[:, ch], scales, wavelet_name, sampling_period=sampling_period)
+            power = np.abs(cwt_mat)**2
+            trial_tfr[:, :, ch] = uniform_filter1d(power, size=smooth_window, axis=1)[:, ::ds_factor]
+            
+        trial_tfr_trimmed = trial_tfr[:, pad_ds:-pad_ds, :]
+        
+        raw_trial_tfrs.append(trial_tfr_trimmed)
+        valid_labels_pass1.append(labels[i])
+
+    if not raw_trial_tfrs:
+        print("No valid epochs extracted.")
+        return
+        
+    # --- PASS 2: Robust session-level baseline and Z-score ---
+    # Average baseline metrics across all unique baseline periods
+    session_base_mean = np.mean(list(baseline_means.values()), axis=0) # Shape: (n_freqs, 1, num_channels)
+    session_base_std = np.mean(list(baseline_stds.values()), axis=0)
+    session_base_std[session_base_std == 0] = 1.0 # Prevent div by zero
+    
+    epoched_cwt = []
+    for trial_tfr in raw_trial_tfrs:
+        # Broadcasting automatically handles the temporal dimension
+        trial_zscored = (trial_tfr - session_base_mean) / session_base_std
+        epoched_cwt.append(trial_zscored)
+
+    # Tensor shape: (n_trials, n_freqs, n_times, n_channels)
+    epoched_cwt_arr = np.stack(epoched_cwt)
+    valid_labels_arr = np.array(valid_labels_pass1)
+
+    # Save output
+    out_folder = PROCESSED_DATA_DIR / subject / session
+    out_folder.mkdir(parents=True, exist_ok=True)
+    out_path = out_folder / f"epoched_cwt_{event_type}.npz"
+    
+    np.savez_compressed(
+        out_path, 
+        cwt_tensor=epoched_cwt_arr, 
+        labels=valid_labels_arr,
+        freqs=frequencies
+    )
+    print(f"Saved CWT tensor {epoched_cwt_arr.shape} to {out_path}")

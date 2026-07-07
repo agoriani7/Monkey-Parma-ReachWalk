@@ -1,0 +1,4 @@
+spikeinterface[full]==0.104.0
+tqdm==4.67.3
+scipy==1.17.1
+pywavelets==1.9.0
