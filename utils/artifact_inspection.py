@@ -56,7 +56,7 @@ def inspect_artifacts(subject: str, session: str, event_type: str = 'grasp', off
     time_vec = np.linspace(-EPOCH_T_PRE, EPOCH_T_POST, samples_pre + samples_post)
     
     # 3. Setup the static Figure and pre-allocate Line2D objects
-    fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18, 10), sharex=True)
+    fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(16, 10), sharex=True)
     fig.subplots_adjust(hspace=0.3)
     
     lines = []
