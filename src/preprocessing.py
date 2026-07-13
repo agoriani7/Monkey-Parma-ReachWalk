@@ -1,7 +1,7 @@
 import spikeinterface.preprocessing as spr
 from src.config import (
-    RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, EVENT_SUFFIXES, 
-    EPOCH_T_PRE, EPOCH_T_POST, BASELINE_T_START, BASELINE_T_END, FREQ_BANDS
+    RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, EVENT_SUFFIXES, FS_LFP,
+    EPOCH_T_PRE, EPOCH_T_POST, BASELINE_T_START, BASELINE_T_END, FREQ_BANDS, FS_ENVELOPES
 )
 from src.io import load_binary_session, load_lfp_recording, load_envelopes
 from scipy.signal import hilbert
@@ -31,7 +31,7 @@ def extract_and_save_lfp(subject, session, n_jobs=1):
 
     # 2. Downsample to an intermediate frequency (e.g., 1000 Hz)
     # Respects Nyquist theorem for the high_gamma band (250 Hz)
-    recording_resampled = spr.resample(recording_bp, resample_rate=1000)
+    recording_resampled = spr.resample(recording_bp, resample_rate=FS_LFP)
 
     # 3. Apply Common Median Reference (CMR) at 1000 Hz
     recording_cmr = spr.common_reference(
@@ -42,7 +42,7 @@ def extract_and_save_lfp(subject, session, n_jobs=1):
 
     # 4. SAVE TO DISK (Crucial step required by documentation)
     # Use 30-second chunks to minimize the 5-second margin overhead.
-    lfp_folder = INTERIM_DATA_DIR / subject / session / "lfp_1000Hz"
+    lfp_folder = INTERIM_DATA_DIR / subject / session / f"lfp_{int(FS_LFP)}Hz"
     
     # If the folder exists, load directly to avoid recomputing
     if lfp_folder.exists():
@@ -61,10 +61,10 @@ def extract_and_save_lfp(subject, session, n_jobs=1):
 def extract_and_save_envelopes(subject: str, session: str) -> None:
     """
     Extracts frequency band envelopes using Hilbert transform, smooths them, 
-    downsamples to 100 Hz, and saves the output to a generic .npz file.
+    downsamples to the target frequency, and saves the output to a generic .npz file.
     """
     out_folder = INTERIM_DATA_DIR / subject / session
-    out_path = out_folder / "band_envelopes_100Hz.npz"
+    out_path = out_folder / f"band_envelopes_{int(FS_ENVELOPES)}Hz.npz"
     
     # If the file exists, skip to avoid recomputing
     if out_path.exists():
@@ -74,16 +74,16 @@ def extract_and_save_envelopes(subject: str, session: str) -> None:
     print(f"Computing and saving envelopes to .npz. Please wait...")
     
     # Load the intermediate LFP recording (0-300Hz)
-    recording_lfp = load_lfp_recording(subject, session, "lfp_1000Hz")
+    recording_lfp = load_lfp_recording(subject, session, f"lfp_{int(FS_LFP)}Hz")
     fs_lfp = recording_lfp.get_sampling_frequency()
     
     num_channels = recording_lfp.get_num_channels()
     num_samples = recording_lfp.get_num_samples()
-    smooth_window_samples = int(0.5 * fs_lfp) # 500 ms window for smoothing
-    target_fs = 100.0
-    ds_factor = int(fs_lfp / target_fs) # Downsampling factor to reach the target 100 Hz for sampling the envelopes
+    smooth_window_samples = int(0.2 * fs_lfp) # 200 ms window for smoothing
+    target_fs = FS_ENVELOPES
+    ds_factor = int(fs_lfp / target_fs) # Downsampling factor to reach the target 200 Hz for sampling the envelopes
     num_samples_ds = len(np.arange(0, num_samples, ds_factor))
-    envelopes_100hz = {}
+    envelopes_ds = {}
     
     for band_name, (fmin, fmax) in FREQ_BANDS.items():
         # 1. Lazy bandpass filter via SpikeInterface
@@ -106,20 +106,22 @@ def extract_and_save_envelopes(subject: str, session: str) -> None:
             smoothed = uniform_filter1d(envelope, size=smooth_window_samples) # Smoothing (500-ms moving mean filter)
             band_envelope_ds[:, ch_idx] = smoothed[::ds_factor] - np.mean(smoothed[::ds_factor]) # Downsample to 100 Hz and mean centering
             
-        envelopes_100hz[band_name] = band_envelope_ds
+        envelopes_ds[band_name] = band_envelope_ds
         
     # Save output to disk in .npz dict
     out_folder.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **envelopes_100hz)
+    np.savez_compressed(out_path, **envelopes_ds)
     
     return
 
-def epoch_and_normalize_envelopes(subject: str, session: str, event_type: str = 'grasp', thr_der: float = 3.0, fs: float = 100.0, max_bad_channels: float = 0.0) -> None:
+def epoch_and_normalize_envelopes(subject: str, session: str, event_type: str = 'grasp', thr_der: float = 3.0, max_bad_channels: float = 0.0) -> None:
     """
     Extracts epochs around events, computes ERD/ERS Z-score normalization based on a 
     pre-event baseline, removes artifactual trials using amplitude thresholds, 
     and saves the extracted 3D tensors.
     """
+
+    fs = FS_ENVELOPES
     envelopes = load_envelopes(subject, session)
     bands = list(envelopes.keys())
     
